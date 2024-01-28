@@ -16,7 +16,8 @@ def timesteps_schedule(
     final_timesteps: int = 150,
 ) -> int:
     """Implements the proposed timestep discretization schedule.
-
+    [Equation in Appendix C in Song2023 Consistency Model]
+    
     Parameters
     ----------
     current_training_step : int
@@ -66,7 +67,7 @@ def improved_timesteps_schedule(
 
     References
     ----------
-    [1] [Improved Techniques For Consistency Training](https://arxiv.org/pdf/2310.14189.pdf)
+    [1] [Improved Techniques For Consistency Training](https://arxiv.org/pdf/2310.14189.pdf) [eq.9]
     """
     total_training_steps_prime = math.floor(
         total_training_steps
@@ -84,7 +85,8 @@ def ema_decay_rate_schedule(
     num_timesteps: int, initial_ema_decay_rate: float = 0.95, initial_timesteps: int = 2
 ) -> float:
     """Implements the proposed EMA decay rate schedule.
-
+    [Equation in Appendix C in Song2023 Consistency Models]
+    
     Parameters
     ----------
     num_timesteps : int
@@ -113,7 +115,8 @@ def karras_schedule(
 ) -> Tensor:
     """Implements the karras schedule that controls the standard deviation of
     noise added.
-
+    [baseline schedule in Karras schedule. Song2023 Consistency models]
+    
     Parameters
     ----------
     num_timesteps : int
@@ -150,7 +153,8 @@ def lognormal_timestep_distribution(
     std: float = 2.0,
 ) -> Tensor:
     """Draws timesteps from a lognormal distribution.
-
+    [See Fig.4 and Eq.10 in the below reference paper]
+    
     Parameters
     ----------
     num_samples : int
@@ -165,11 +169,11 @@ def lognormal_timestep_distribution(
     Returns
     -------
     Tensor
-        Timesteps drawn from the lognormal distribution.
+        Timesteps drawn from the lognormal distribution. (sigmas)
 
     References
     ----------
-    [1] [Improved Techniques For Consistency Training](https://arxiv.org/pdf/2310.14189.pdf)
+    [1] [Improved Techniques For Consistency Training](https://arxiv.org/pdf/2310.14189.pdf) (eq.10)
     """
     pdf = torch.erf((torch.log(sigmas[1:]) - mean) / (std * math.sqrt(2))) - torch.erf(
         (torch.log(sigmas[:-1]) - mean) / (std * math.sqrt(2))
@@ -224,7 +228,8 @@ def skip_scaling(
     sigma: Tensor, sigma_data: float = 0.5, sigma_min: float = 0.002
 ) -> Tensor:
     """Computes the scaling value for the residual connection.
-
+    [c_skip. implementation]
+    
     Parameters
     ----------
     sigma : Tensor
@@ -246,7 +251,8 @@ def output_scaling(
     sigma: Tensor, sigma_data: float = 0.5, sigma_min: float = 0.002
 ) -> Tensor:
     """Computes the scaling value for the model's output.
-
+    [c_out implementation]
+    
     Parameters
     ----------
     sigma : Tensor
@@ -493,8 +499,6 @@ class ImprovedConsistencyTraining:
         ----------
         model : nn.Module
             Both teacher and student model.
-        teacher_model : nn.Module
-            Teacher model.
         x : Tensor
             Clean data.
         current_training_step : int
@@ -609,7 +613,7 @@ class ConsistencySamplingAndEditing:
             from random gaussian noise. This is useful for tasks like style transfer.
         add_initial_noise : bool, default=True
             Whether to add noise at the start of the schedule. Useful for tasks like interpolation
-            where noise will alerady be added in advance.
+            where noise will already be added in advance.
         clip_denoised : bool, default=False
             Whether to clip denoised values to [-1, 1] range.
         verbose : bool, default=False
@@ -673,7 +677,7 @@ class ConsistencySamplingAndEditing:
         verbose: bool = False,
         **kwargs: Any,
     ) -> Tensor:
-        """Runs the interpolation  loop.
+        """Runs the interpolation loop.
 
         Parameters
         ----------
@@ -728,3 +732,140 @@ class ConsistencySamplingAndEditing:
         inverse_transform_fn: Callable[[Tensor], Tensor] = lambda x: x,
     ) -> Tensor:
         return inverse_transform_fn(transform_fn(y) * (1.0 - mask) + x * mask)
+
+
+@dataclass
+class ConsistencyDistillationOutput:
+    """Type of the output of the ConsistencyDistillation.__call__ method.
+    [Jinwei] TODO: for distillation, seems no need for timesteps schedule (curriculum learning)
+    
+    Attributes
+    ----------
+    predicted : Tensor
+        Predicted values.
+    target : Tensor
+        Target values.
+    num_timesteps : int
+        Number of timesteps at the current point in training from the timestep discretization schedule.
+    sigmas : Tensor
+        Standard deviations of the noise.
+    loss_weights : Optional[Tensor], default=None
+        Weighting for the Improved Consistency Training loss.
+    """
+
+    predicted: Tensor
+    target: Tensor
+    num_timesteps: int
+    sigmas: Tensor
+    loss_weights: Optional[Tensor] = None
+
+
+class ConsistencyDistillation:
+    """Implements the Consistency Distillation algorithm proposed in the paper.
+
+    Parameters
+    ----------
+    ode_solver: nn.Module (ODE solver)
+    sigma_min : float, default=0.002
+        Minimum standard deviation of the noise.
+    sigma_max : float, default=80.0
+        Maximum standard deviation of the noise.
+    rho : float, default=7.0
+        Schedule hyper-parameter.
+    sigma_data : float, default=0.5
+        Standard deviation of the data.
+    initial_timesteps : int, default=2
+        Schedule timesteps at the start of training.
+    final_timesteps : int, default=150
+        Schedule timesteps at the end of training.
+    """
+
+    def __init__(
+        self,
+        ode_solver: nn.Module,
+        sigma_min: float = 0.002,
+        sigma_max: float = 80.0,
+        rho: float = 7.0,
+        sigma_data: float = 0.5,
+        initial_timesteps: int = 2,
+        final_timesteps: int = 150,
+    ) -> None:
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.rho = rho
+        self.sigma_data = sigma_data
+        self.initial_timesteps = initial_timesteps
+        self.final_timesteps = final_timesteps
+
+    def __call__(
+        self,
+        student_model: nn.Module,
+        teacher_model: nn.Module,
+        x: Tensor,
+        current_training_step: int,
+        total_training_steps: int,
+        **kwargs: Any,
+    ) -> ConsistencyDistillationOutput:
+        """Runs one step of the consistency distillation algorithm.
+
+        Parameters
+        ----------
+        student_model : nn.Module
+            Model that is being trained.
+        teacher_model : nn.Module
+            An EMA of the student model.
+        x : Tensor
+            Clean data.
+        current_training_step : int
+            Current step in the training loop.
+        total_training_steps : int
+            Total number of steps in the training loop.
+        **kwargs : Any
+            Additional keyword arguments to be passed to the models.
+
+        Returns
+        -------
+        ConsistencyDistillationOutput
+            The predicted and target values for computing the loss as well as sigmas (noise levels).
+        """
+        num_timesteps = timesteps_schedule(
+            current_training_step,
+            total_training_steps,
+            self.initial_timesteps,
+            self.final_timesteps,
+        )
+        sigmas = karras_schedule(
+            num_timesteps, self.sigma_min, self.sigma_max, self.rho, x.device
+        )
+        noise = torch.randn_like(x)
+
+        timesteps = torch.randint(0, num_timesteps - 1, (x.shape[0],), device=x.device)
+
+        current_sigmas = sigmas[timesteps]
+        next_sigmas = sigmas[timesteps + 1]
+
+        next_noisy_x = x + pad_dims_like(next_sigmas, x) * noise
+
+        next_x = model_forward_wrapper(
+            student_model,
+            next_noisy_x,
+            next_sigmas,
+            self.sigma_data,
+            self.sigma_min,
+            **kwargs,
+        )
+
+        with torch.no_grad():
+            #-- need to check the correctness of this line TODO --
+            current_noisy_x = next_noisy_x + (current_sigmas-next_sigmas) * self.ode_solver(next_noisy_x, next_sigmas)
+            #current_noisy_x = x + pad_dims_like(current_sigmas, x) * noise
+            current_x = model_forward_wrapper(
+                teacher_model,
+                current_noisy_x,
+                current_sigmas,
+                self.sigma_data,
+                self.sigma_min,
+                **kwargs,
+            )
+
+        return ConsistencyDistillationOutput(next_x, current_x, num_timesteps, sigmas)
